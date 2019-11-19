@@ -58,6 +58,10 @@ class H36M(Dataset):
         num_per_cam = int(self.num_images//
             (len(self.scenarios)*len(self.subjects)*self.num_cameras)) 
 
+        num_per_scen = 100 if num_per_scen == 0 else num_per_scen
+        num_per_subj = 100 if num_per_subj == 0 else num_per_subj
+        num_per_cam = 100 if num_per_cam == 0 else num_per_cam
+
         scen = idx // num_per_scen
         scen = len(self.scenarios) - 1 if scen >= len(self.scenarios) else scen
         idx -= scen * num_per_scen
@@ -98,7 +102,8 @@ class H36M(Dataset):
         joints = th.tensor(datapoint['annotations_2d'])
         image, joints = prepare_input(image, joints)
 
-        return image, joints
+        joints_valid = ~th.isnan(joints.sum(dim=1)) # to get same output as MPII
+        return image, joints, joints_valid
 
         # _3d_ = one_data['annotations_3d'].reshape(-1,3)
         # x_, y_, z_ = _3d_[:,0], _3d_[:,1], _3d_[:,2] 
