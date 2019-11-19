@@ -31,9 +31,9 @@ def init_training(datasets=(H36M, MPII), num_domains=2,
     pose_regr = models.PoseRegressor().to(device)
     sub_nets = {'fe':feat_extr, 'dd':dom_discr, 'pr':pose_regr}
 
-    optimizer_feat_extr = Adam(feat_extr.parameters(), lr=1e-4)
-    optimizer_dom_discr = Adam(dom_discr.parameters(), lr=1e-4)
-    optimizer_pose_regr = Adam(pose_regr.parameters(), lr=1e-4)
+    optimizer_feat_extr = Adam(feat_extr.parameters(), lr=1e-3)
+    optimizer_dom_discr = Adam(dom_discr.parameters(), lr=1e-4) # ? TODO: tune these parameters
+    optimizer_pose_regr = Adam(pose_regr.parameters(), lr=1e-3)
     optimizers = {'fe':optimizer_feat_extr, 'dd':optimizer_dom_discr, 'pr':optimizer_pose_regr}
     
     criterion_dom_discr = BCELoss()
@@ -76,7 +76,9 @@ def save_state(epoch, sub_nets, optimizers, losses):
 
     th.save(state, save_path+'state.pth')
     th.save(losses, save_path+'losses.pth')
-    th.save({'epoch':epoch}, save_path+'params.pth')
+
+    th.save(epoch, save_path+'epoch.pth')
+    th.save(params, save_path+'params.pth')
 
     print("\n ===>", dt(), "epoch = {}. ".format(epoch))
     print("Model is saved to {}".format(save_path))
@@ -97,6 +99,7 @@ def load_state(sub_nets, optimizers):
 
     losses = th.load(save_path+'losses.pth')
     params = th.load(save_path+'params.pth')
+    epoch = th.load(save_path+'epoch.pth')
 
     return losses, params
 
@@ -175,6 +178,11 @@ if __name__ == '__main__':
 
     global device
     device = th.device('cuda:{}'.format(gpu_id))
+
+    global params
+    params = {'datasets':datasets, 'num_domains':num_domains, 'gpu_id':gpu_id, 
+        'batch_size':batch_size, 'num_epochs':num_epochs, 'save_each_epoch':save_each_epoch, 
+        'num_train_imgs':num_train_imgs, 'num_val_imgs':num_val_imgs}
 
     init = init_training(datasets=datasets, 
         num_domains=num_domains, batch_size=batch_size, 
