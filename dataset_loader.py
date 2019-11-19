@@ -181,7 +181,7 @@ class MPII(Dataset):
         joints = map_joints(joints) # rename all joints acc. to the H36M protocol
 
         joints_valid = joints.sum(dim=1) != 0 # 0,0 - non-visible points
-        joints = joints[joints_valid]
+        # joints = joints[joints_valid] # only for visualization
 
         image, joints = prepare_input(image, joints)
 

@@ -81,9 +81,12 @@ class DamNet(nn.Module):
             for key in ordered_keys:
                 flow[key] = d[key]
 
+            # if not self.debug:
+            #     del flow['avgpool']
+            #     del flow['fc']
+
             if not self.debug:
-                del flow['avgpool']
-                del flow['fc']
+                flow['fc'] = nn.Linear(2048, 256) # instead it would give 1000 classes
 
             return flow
 
@@ -195,7 +198,7 @@ class DomainClassifier(nn.Module):
     d_hat = F_d(R(Z)), where R - the gradient reversal pseudo-function
     from the DANN paper.
     '''
-    def __init__(self, num_features=2048, inner_features=1024,
+    def __init__(self, in_features=256, hidden_features=256,
                     num_domains=2, lambd=1,seed=0):
         super(DomainClassifier, self).__init__()
         th.manual_seed(0)
@@ -203,9 +206,9 @@ class DomainClassifier(nn.Module):
 
         self.gradreverse = GradientReversal(lambd)
 
-        fc1 = nn.Linear(num_features, inner_features) 
-        fc2 = nn.Linear(inner_features, inner_features)
-        fc3 = nn.Linear(inner_features, self.num_domains) 
+        fc1 = nn.Linear(in_features, hidden_features) 
+        fc2 = nn.Linear(hidden_features, hidden_features)
+        fc3 = nn.Linear(hidden_features, self.num_domains) 
         self.layers = nn.Sequential(*[
                 fc1, nn.ReLU(inplace=True),
                 fc2, nn.ReLU(inplace=True),
@@ -217,6 +220,23 @@ class DomainClassifier(nn.Module):
         z = th.sigmoid(z)
         return z
 
+
+class PoseRegressor(nn.Module):
+    ''' Produces Pose given feature vector Z.
+    '''
+    def __init__(self, in_features=256, hidden_features=256, out_features=15*2):
+        super(PoseRegressor, self).__init__()
+
+        fc1 = nn.Linear(in_features, hidden_features) 
+        fc2 = nn.Linear(hidden_features, out_features)
+        self.layers = nn.Sequential(*[
+                fc1, nn.ReLU(inplace=True),
+                fc2])
+
+    def forward(self, z):
+        z = self.layers(z)
+        z = z.view(-1, 15,2)
+        return z
 
 
 
