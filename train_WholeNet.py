@@ -19,23 +19,14 @@ SAVE_PATH = './saved_models/'
 def dt():
     return datetime.now().strftime('%H:%M:%S')
 
-def init_training(datasets=(H36M, MPII), num_domains=2, 
+def init_training(datasets=(H36M, MPII), num_domains=2, do_da=False,
         num_train_imgs=1000, num_val_imgs=100,
-        batch_size=10, seed=0):
+        batch_size=10):
 
-    th.manual_seed(seed)
+    print(dt(), ' Loading model... ')
+    model = models.WholeNet(num_domains, do_da=do_da).to(device)
+    optimizer = Adam(model.parameters(), lr=1e-3)
 
-    print(dt(), ' Loading models... ')
-    feat_extr = models.DamNet(num_domains=num_domains).to(device)
-    dom_discr = models.DomainClassifier(num_domains=num_domains).to(device)
-    pose_regr = models.PoseRegressor().to(device)
-    sub_nets = {'fe':feat_extr, 'dd':dom_discr, 'pr':pose_regr}
-
-    optimizer_feat_extr = Adam(feat_extr.parameters(), lr=1e-3)
-    optimizer_dom_discr = Adam(dom_discr.parameters(), lr=1e-4) # ? TODO: tune these parameters
-    optimizer_pose_regr = Adam(pose_regr.parameters(), lr=1e-3)
-    optimizers = {'fe':optimizer_feat_extr, 'dd':optimizer_dom_discr, 'pr':optimizer_pose_regr}
-    
     criterion_dom_discr = BCELoss()
     criterion_pose_regr = L1Loss()
     criterions = {'dd':criterion_dom_discr, 'pr':criterion_pose_regr}
@@ -50,30 +41,29 @@ def init_training(datasets=(H36M, MPII), num_domains=2,
                                              [True, False]):
             dataset = datasets[i](num_images=num_images, mode=mode)
             dataloaders[i][mode] = DataLoader(dataset, batch_size=batch_size, 
-                shuffle=shuffle, num_workers=20)
+                shuffle=shuffle, num_workers=5)
+            print(dt(), ' Data for the domain {} (mode {}) is composed.'.format(i, mode))
 
-    print(dt(), ' Initialization is done. ')
+    print(dt(), ' Initialization is done. \n________________________________')
 
-    return sub_nets, optimizers, criterions, dataloaders
+    return model, optimizer, criterions, dataloaders
 
 
-def compose_d(batch_size, domain_idx):
-    x = th.zeros((batch_size,2))
+def compose_d(batch_size, domain_idx, num_domains):
+    x = th.zeros((batch_size, num_domains))
     x[:,domain_idx] = 1
     return x.to(device)
 
 
-def save_state(epoch, sub_nets, optimizers, losses):
-    save_path = SAVE_PATH+exp_name+'/' if exp_name is not None else SAVE_PATH
+def save_state(epoch, model, optimizer, losses):
     if not os.path.isdir(save_path):
         os.mkdir(save_path)
 
     state = {'rng_state':th.get_rng_state(),\
              'rng_states_cuda':th.cuda.get_rng_state_all()}
 
-    for key in ['fe', 'dd', 'pr']:
-        state[key+'_state_dict'] = sub_nets[key].state_dict()
-        state[key+'_opt_state_dict'] = optimizers[key].state_dict()
+    state['state_dict'] = model.state_dict()
+    state['opt_state_dict'] = optimizer.state_dict()
 
     th.save(state, save_path+'state.pth')
     th.save(losses, save_path+'losses.pth')
@@ -85,16 +75,14 @@ def save_state(epoch, sub_nets, optimizers, losses):
     print("Model is saved to {}".format(save_path))
 
 
-def load_state(sub_nets, optimizers):
-    save_path = SAVE_PATH+exp_name+'/' if exp_name is not None else SAVE_PATH
+def load_state(model, optimizer):
     assert os.path.isdir(save_path), 'There is no the directory: {}'.format(save_path)
 
     state = th.load(save_path+'state.pth',
         map_location=lambda storage,loc:storage.to(device))
     
-    for key in ['fe', 'dd', 'pr']:
-        sub_nets[key].load_state_dict(state[key+'_state_dict'])
-        optimizers[key].load_state_dict(state[key+'_opt_state_dict'])  
+    model.load_state_dict(state['state_dict'])
+    optimizer.load_state_dict(state['opt_state_dict'])  
     
     th.set_rng_state(state['rng_state'].cpu()) 
 
@@ -105,63 +93,58 @@ def load_state(sub_nets, optimizers):
     return losses, params
 
 
-def run_epoch(mode, sub_nets, optimizers, criterions, dataloaders, losses):
+def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, epoch):
     hi_str = ' Training...' if mode == 'train' else ' Validation...'
     print(dt(), hi_str)
 
     print(dt(), 'lengths of dataloaders: ', 
         [len(dataloaders[domain][mode]) for domain in dataloaders])
 
-    for sample0, sample1 in tqdm(zip(dataloaders[0][mode],\
-                                    dataloaders[1][mode])):
+    for batch_idx, (sample0, sample1) in tqdm(enumerate(zip(dataloaders[0][mode],\
+                                        dataloaders[1][mode]))):
         # sample0 - H36M
         # sample1 - MPII
 
+        # if batch_idx+1 % 10 == 0:
+        #     print(dt(), 'Batch {}'.format(batch_idx))
         for domain_idx, sample in enumerate([sample0, sample1]):
 
             if mode == 'train':
-                [opt.zero_grad() for opt in optimizers.values()]
+                optimizer.zero_grad()
 
             imgs, joints, joints_valid = sample
             imgs = imgs.float().to(device)
 
             if mode == 'val':
                 with th.no_grad(): 
-                    z = sub_nets['fe'](imgs, domain_idx)
-                    d_hat = sub_nets['dd'](z)
+                    p_hat, d_hat, z = model(imgs, domain_idx)
             else:
-                z = sub_nets['fe'](imgs, domain_idx)
-                d_hat = sub_nets['dd'](z)
+                p_hat, d_hat, z = model(imgs, domain_idx)
 
-            d = compose_d(d_hat.size(0), domain_idx)
-            dd_loss = criterions['dd'](d_hat, d)
-
-            losses[domain_idx]['dd'][mode].append(dd_loss.data.cpu().numpy().item())
+            if model.do_da:
+                d = compose_d(d_hat.size(0), domain_idx, model.num_domains)
+                d_loss = criterions['dd'](d_hat, d)
+                losses[domain_idx]['dd'][mode].append(d_loss.data.cpu().numpy().item())
 
             if domain_idx == 0: # source domain, has labels
-                p_hat = joints.float().to(device)
-                if mode == 'val':
-                    with th.no_grad(): p = sub_nets['pr'](z)
-                else:
-                   p = sub_nets['pr'](z) 
-                
+                p = joints.float().to(device)
                 p_loss = criterions['pr'](p_hat[joints_valid], p[joints_valid])
                 losses[domain_idx]['pr'][mode].append(p_loss.data.cpu().numpy().item())
                 
-                if mode == 'train':
-                    p_loss.backward(retain_graph=True)
-                    optimizers['pr'].step()
-
             if mode == 'train':
-                dd_loss.backward()
-                optimizers['fe'].step()
-                optimizers['dd'].step()          
+                if domain_idx == 0:
+                    p_loss.backward(retain_graph=True) if model.do_da else \
+                    p_loss.backward(retain_graph=False)
+                if model.do_da:
+                    d_loss.backward()
+                optimizer.step()
+        
 
     #######################################################################
     #######################################################################
     #######################################################################
 
-if __name__ == '__main__':
+def main():
 
     opt = parse_args()
 
@@ -173,22 +156,33 @@ if __name__ == '__main__':
     save_each_epoch = opt.save_each_epoch
     num_train_imgs = opt.num_train_imgs 
     num_val_imgs = opt.num_val_imgs
+    do_da = opt.do_da
+    return_z = opt.return_z
+
+    global seed
+    seed = opt.seed
 
     global exp_name
     exp_name = opt.exp_name
 
+    global save_path
+    save_path = SAVE_PATH+exp_name+'/' if exp_name is not None else SAVE_PATH
+
     global device
-    device = th.device('cuda:{}'.format(gpu_id))
+    device = th.device('cuda:{}'.format(gpu_id)) # cpu is not even considered
+    
+    th.manual_seed(seed)
 
     global params
     params = {'datasets':datasets, 'num_domains':num_domains, 'gpu_id':gpu_id, 
         'batch_size':batch_size, 'num_epochs':num_epochs, 'save_each_epoch':save_each_epoch, 
-        'num_train_imgs':num_train_imgs, 'num_val_imgs':num_val_imgs}
+        'num_train_imgs':num_train_imgs, 'num_val_imgs':num_val_imgs,
+        'do_da':do_da, 'return_z':return_z, 'save_path':save_path}
 
-    init = init_training(datasets=datasets, 
-        num_domains=num_domains, batch_size=batch_size, 
-        num_train_imgs=num_train_imgs, num_val_imgs=num_val_imgs)
-    sub_nets, optimizers, criterions, dataloaders = init
+    init = init_training(datasets, num_domains, do_da,
+        num_train_imgs, num_val_imgs, batch_size)
+
+    model, optimizer, criterions, dataloaders = init
 
     # only two domains: H36M and MPII
     # only two losses: dd and pr. 
@@ -196,17 +190,26 @@ if __name__ == '__main__':
               1:{'dd':{'train':[], 'val':[]}, 'pr':{'train':[], 'val':[]}}}
 
     for epoch in range(1, num_epochs+1):
-        run_epoch('train', sub_nets, optimizers, criterions, dataloaders, losses)
-        run_epoch('val', sub_nets, optimizers, criterions, dataloaders, losses)
+        run_epoch('train', model, optimizer, criterions, dataloaders, losses, epoch)
+        run_epoch('val', model, optimizer, criterions, dataloaders, losses, epoch)
+        
+        progress = epoch/num_epochs
+        model.update_plasts(progress)
+        model.update_lambd(progress)
+
+        tmp_losses = losses.copy()
+        th.save(tmp_losses, save_path+'tmp_losses.pth')
 
         if epoch % save_each_epoch == 0 or epoch == 1:
-            save_state(epoch, sub_nets, optimizers, losses)
+            save_state(epoch, model, optimizer, losses)
 
         print('----------------------------------------')
         print(dt(), 'epoch {} out of {} is finished.'.format(epoch, num_epochs))
         print('----------------------------------------')
     
 
+if __name__ == '__main__':
 
+    main()
 
-
+    

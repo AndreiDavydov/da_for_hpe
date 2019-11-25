@@ -5,7 +5,7 @@ from resnet.resnet import resnet50
 PATH_RESNET50_PRETRAINED = './resnet/resnet50.pth'
 
 class DamNet(nn.Module):
-    ''' Produces DAMNet (based on the DAMN paper)
+    ''' Produces DamNet (based on the DAMN paper)
     with the ResNet-50 as a backbone.
     As written in the original paper, this model
     "encodes sample X from domain d into a feature 
@@ -16,12 +16,12 @@ class DamNet(nn.Module):
     ## "layer1", "layer2", "layer3", "layer4"
     ## "avgpool", "fc"
     '''
-    def __init__(self, num_domains=2, pretrained=True, seed=0, debug=False):
+    def __init__(self, num_domains=2, pretrained=True, z_features=256, debug=False):
         super(DamNet, self).__init__()
 
-        th.manual_seed(seed)
         self.num_domains = num_domains
         self.num_flows = num_domains 
+        self.z_features = z_features # dimension of latent vector Z
         # can vary from unit to unit, here it is fixed
 
         ########### for checking correct ResNet50 classification quality.
@@ -30,7 +30,7 @@ class DamNet(nn.Module):
 
         flows = []
         for _ in range(self.num_flows): 
-            flow = resnet50(pretrained=pretrained)
+            flow = resnet50(pretrained=False)
             if pretrained:
                 flow.load_state_dict(th.load(PATH_RESNET50_PRETRAINED)) 
             flow = self._compose_flow(flow)
@@ -38,25 +38,29 @@ class DamNet(nn.Module):
                                                                         
         self.units_names = flow.keys()                           
         self.units = self._compose_units(flows)   
-
         self.gates_ws, self.plasts_ws = self._init_gates()
-
+        
     def _init_gates(self):
-        gates_ws, plasts_ws = nn.ParameterDict(), nn.ParameterDict() 
+        gates_ws, plasts_ws = nn.ParameterDict(), {}#nn.ParameterDict() 
         # HOW TO DO IT CORRECTLY, ParamDict of ParamDicts?
-        for domain_ind in range(self.num_domains):
-            key = 'domain_'+str(domain_ind)
+        for domain_idx in range(self.num_domains):
+            key = 'domain_'+str(domain_idx)
             for unit_name in self.units_names:
                 # Not clear how to init plasticities correctly. 
                 # So far all gates are equal at the first epoch.
                 key_unit = key+'_'+unit_name
                 gates_ws[key_unit] = nn.Parameter(
                     th.randn((self.num_flows, 1,1,1,1)), requires_grad=True)
-                plasts_ws[key_unit] = nn.Parameter(-th.log(
-                    th.tensor(1/(1/self.num_flows) - 1))/ \
-                        (gates_ws[key_unit].detach()))
+                # plasts_ws[key_unit] = nn.Parameter(-th.log(
+                #     th.tensor(1/(1/self.num_flows) - 1))/ \
+                #         (gates_ws[key_unit].detach()))
+                plasts_ws[key_unit] = self._compute_plast(gates_ws[key_unit].data)
 
         return gates_ws, plasts_ws
+
+    def _compute_plast(self, gate):
+        log_arg = th.tensor(1. / (1. / self.num_flows) - 1.)
+        return -th.log(log_arg) / gate
 
     def _compose_flow(self, flow, arch_name='resnet'):
         ''' Takes the original backbone network and transforms it in 
@@ -67,7 +71,7 @@ class DamNet(nn.Module):
             d = dict(flow.named_children())
 
             # combines first four transformations in one layer
-            # ("conv1" in DAMNet notation for ResNet-50)
+            # ("conv1" in DamNet notation for ResNet-50)
             d['layer0'] =[]
             for key in ['conv1', 'bn1', 'relu', 'maxpool']: 
                 d['layer0'].append(d[key])
@@ -81,12 +85,10 @@ class DamNet(nn.Module):
             for key in ordered_keys:
                 flow[key] = d[key]
 
-            # if not self.debug:
-            #     del flow['avgpool']
-            #     del flow['fc']
-
-            if not self.debug:
-                flow['fc'] = nn.Linear(2048, 256) # instead it would give 1000 classes
+            if not self.debug: # "debug" mode serves for debugging ResNet50
+                # del flow['avgpool']
+                # del flow['fc']
+                flow['fc'] = nn.Linear(2048, self.z_features) # otherwise it would give 1000 classes
 
             return flow
 
@@ -122,18 +124,19 @@ class DamNet(nn.Module):
             return outs.mean(dim=0)
 
         # correct 5-ndim layer case
-        gates = th.sigmoid(gates_ws*plasts_ws)
+        device = gates_ws.device
+        gates = th.sigmoid(gates_ws*plasts_ws.to(device))
         return (outs * gates).sum(dim=0)
 
-    def forward(self, x, domain_ind):
+    def forward(self, x, domain_idx):
         '''
-        Computes output of the DAMNet. 
+        Computes output of the DamNet. 
         x - input vector, batch of images.
-        domain_ind - some index (or key) of the domain, 
+        domain_idx - some index (or key) of the domain, 
                      to be able to choose what gates to learn.
         '''
-        key = 'domain_'+str(domain_ind) \
-                if isinstance(domain_ind, int) else domain_ind
+        key = 'domain_'+str(domain_idx) \
+                if isinstance(domain_idx, int) else domain_idx
 
         assert (int(key[-1]) <= self.num_domains-1), \
             'domain index is incorrect, must be from {}, but {} was given.'.\
@@ -146,7 +149,7 @@ class DamNet(nn.Module):
                 x = th.flatten(x,1)
 
             outs = []
-            # print(unit_name)
+
             for flow_ind in range(len(unit)):
                 out = unit[flow_ind](x)
                 outs.append(out)
@@ -154,7 +157,6 @@ class DamNet(nn.Module):
 
             x = self._aggregation(outs, self.gates_ws[key+'_'+unit_name], 
                             self.plasts_ws[key+'_'+unit_name])
-            # print(x.shape)
         return x
 
 
@@ -167,7 +169,7 @@ class GradientReversalFunction(th.autograd.Function):
     
     The implementation is taken from 
     https://github.com/jvanvugt/pytorch-domain-adaptation/blob/master/utils.py
-    Thanks to author.
+    Thanks to its author.
     """
 
     @staticmethod
@@ -194,19 +196,21 @@ class GradientReversal(th.nn.Module):
 class DomainClassifier(nn.Module):
     ''' Produces Domain Classifier network (F_d) that
     predicts a D-dimensional vector of domain probabilities d_hat
-    given the feature vector Z from the DAMNet.
+    given the feature vector Z from the DamNet.
     d_hat = F_d(R(Z)), where R - the gradient reversal pseudo-function
     from the DANN paper.
     '''
-    def __init__(self, in_features=256, hidden_features=256,
-                    num_domains=2, lambd=1,seed=0):
+    def __init__(self, z_features=256, hidden_features=256,
+                    num_domains=2, lambd=0):
+
         super(DomainClassifier, self).__init__()
-        th.manual_seed(0)
+
         self.num_domains = num_domains
+        self.lambd = lambd
 
-        self.gradreverse = GradientReversal(lambd)
+        self.gradreverse = GradientReversal(self.lambd)
 
-        fc1 = nn.Linear(in_features, hidden_features) 
+        fc1 = nn.Linear(z_features, hidden_features) 
         fc2 = nn.Linear(hidden_features, hidden_features)
         fc3 = nn.Linear(hidden_features, self.num_domains) 
         self.layers = nn.Sequential(*[
@@ -224,19 +228,84 @@ class DomainClassifier(nn.Module):
 class PoseRegressor(nn.Module):
     ''' Produces Pose given feature vector Z.
     '''
-    def __init__(self, in_features=256, hidden_features=256, out_features=15*2):
+    def __init__(self, z_features=256, hidden_features=256, num_joints=15, joint_dim=2):
         super(PoseRegressor, self).__init__()
 
-        fc1 = nn.Linear(in_features, hidden_features) 
-        fc2 = nn.Linear(hidden_features, out_features)
+        self.num_joints = num_joints
+        self.joint_dim = joint_dim
+        fc1 = nn.Linear(z_features, hidden_features) 
+        fc2 = nn.Linear(hidden_features, self.num_joints*self.joint_dim)
         self.layers = nn.Sequential(*[
                 fc1, nn.ReLU(inplace=True),
                 fc2])
 
     def forward(self, z):
         z = self.layers(z)
-        z = z.view(-1, 15,2)
+        z = z.view(-1, self.num_joints, self.joint_dim)
         return z
+
+
+################################################
+
+
+class WholeNet(nn.Module):
+    ''' Combines the whole pipeline in one architecture with
+    one joint "forward" function and schedulers for hyperparameters.
+    '''
+    def __init__(self, num_domains=2, pretrained=True, 
+                        z_features=256, hidden_features=256, num_joints=15, joint_dim=2,
+                        do_da=False, return_z=False, debug=False):
+        super(WholeNet, self).__init__()
+
+        self.num_domains = num_domains
+        self.do_da = do_da # "do Domain Adaptation" flag 
+        self.return_z = return_z # "return latent z" flag
+
+        if debug:
+            z_featues = 1000 # it is done violently to correspond to ResNet50 evaluation
+
+        # "fe" - feature extractor, "pr" - pose regressor, "dd" - domain discriminator
+        self.fe = DamNet(self.num_domains, pretrained, z_features=z_features, debug=debug)
+        self.pr = PoseRegressor(z_features, hidden_features, num_joints, joint_dim)
+
+        if do_da:
+            lambd_init = 0
+            self.dd = DomainClassifier(z_features, hidden_features, num_domains, lambd_init)
+
+
+    def update_plasts(self, progress=None, base=1.1):
+        ''' Does update of plasticities parameters given training progress.
+        '''
+        for key in self.fe.plasts_ws:
+            self.fe.plasts_ws[key].data *= base
+
+    def update_lambd(self, progress, gamma=10):
+        ''' Does update of lambda parameter in GRL given the training progress.
+        progress - float in the range [0,1]
+        '''
+        # assert self.do_da, 'One cannot update parameter Lambda, '+\
+        #             'because DomainClassifier network has not been initialized.'
+        if self.do_da:
+            self.dd.lambd = 2.*th.sigmoid(th.tensor(gamma*progress)) - 1.
+            self.dd.gradreverse = GradientReversal(self.dd.lambd)
+
+    def forward(self, x, domain_idx):
+        out = [None, None, None]
+
+        z = self.fe(x, domain_idx)
+
+        if domain_idx == 0: # 0 implies LABELED data (H36M in simple case)
+            p = self.pr(z)
+            out[0] = p
+        
+        if self.do_da:
+            d = self.dd(z)
+            out[1] = d
+
+        if self.return_z:
+            out[2] = z
+
+        return out
 
 
 
