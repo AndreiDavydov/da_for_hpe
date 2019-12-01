@@ -26,6 +26,10 @@ class H36M(Dataset):
                 'Incorrect mode type! Only "train" or "val" are available.')
         self.PATH_H36M = PATH_H36M
         self.mode = mode
+
+        # train: 1475888. #cams: 560. in cam min,max:  992,6339.
+        # val:    417329. #cams: 175. in cam min,max: 1008,5873.
+
         self.num_images = num_images
 
         pkl_path = self.PATH_H36M+mode+'_data.pkl'
@@ -40,6 +44,12 @@ class H36M(Dataset):
             del self.pkl[scen]
         self.scenarios = list(self.pkl.keys())
 
+        # there are no broken folders in train, 
+        # but there is one in the val:
+        # "Directions, 11, Directions.54138969".
+        if self.mode == 'val':
+            del self.pkl['Directions'][11]['Directions.54138969']
+
         self.subjects = (1,5,6,7,8) if mode == 'train' else (9,11)
         self.num_cameras = 8
 
@@ -50,6 +60,8 @@ class H36M(Dataset):
         ''' The problem is that it is hard to prepare dataset as a list 
         of datapaths. Hence, we propose the technique of getting i's sample
         based on the total number of images only.
+
+        TODO!!!
         '''
         num_per_scen = int(self.num_images//
             len(self.scenarios))
@@ -60,7 +72,7 @@ class H36M(Dataset):
 
         num_per_scen = 100 if num_per_scen == 0 else num_per_scen
         num_per_subj = 100 if num_per_subj == 0 else num_per_subj
-        num_per_cam = 100 if num_per_cam == 0 else num_per_cam
+        num_per_cam  = 100 if num_per_cam  == 0 else num_per_cam
 
         scen = idx // num_per_scen
         scen = len(self.scenarios) - 1 if scen >= len(self.scenarios) else scen
@@ -74,25 +86,18 @@ class H36M(Dataset):
 
         return scen, subj, cam, idx
 
-    # def transforms(self, image, depth):
-
-    #     assert self.crop_size < min(depth.shape), \
-    #     'Inconsistent crop size, it is bigger than image dimensions!'
-    #     y0 = np.random.randint(0,image.shape[0] - self.crop_size)
-    #     x0 = np.random.randint(0,image.shape[1] - self.crop_size)
-
-    #     image = image[y0:y0+self.crop_size, x0:x0+self.crop_size]
-    #     depth = depth[y0:y0+self.crop_size, x0:x0+self.crop_size]
-    #     return image, depth
 
     def __getitem__(self, idx):
         scen, subj, cam, idx = self.get_item(idx)
 
         scen = self.scenarios[scen]
         subj = self.subjects[subj]
+
+        if scen == 'Directions' and subj == 11 and cam == 7:
+            cam = 6
         cam = list(self.pkl[scen][subj].keys())[cam]
         name = list(self.pkl[scen][subj][cam].keys())[idx]
-
+            
         datapoint = self.pkl[scen][subj][cam][name]
 
         img_path = PATH_H36M+'S'+str(subj)+'/Images/'+cam+'_000000'+name+'.jpg'
@@ -136,48 +141,57 @@ class MPII(Dataset):
         self.mean = mean['mean']
         self.std = mean['std']
 
-        annotations = json.load(open(PATH_MPII+'Annotations/mpii_annotations.json', 'rb'))
-        self.annotations, self.ids = self._initialize_annotations(annotations)
+        # As the number of images in MPII is relatively small (17408), 
+        # we split its annotations into "train" and "val" sets.
+        # Both lists of annotations are saved in the "datasets/MPII" folder.
+        
+        # annotations = json.load(open(PATH_MPII+'Annotations/mpii_annotations.json', 'rb'))
+        # self.annotations, self.ids = self._initialize_annotations(annotations)
+
+        self.annotations = th.load('./datasets/MPII/'+mode+'_annotations.pth')
+        self.annotations = self.annotations[:num_images]
 
     def __len__(self):
-        return self.num_images
+        return len(self.annotations)
 
-    def _initialize_annotations(self, annotations):
-        ''' Firstly, we follow "easy" strategy, processing MPII dataset.
-        It likes to contain several people on same image, but keeping them
-        in different "annotation" dictionaries. 
-        We'd like to delete ALL non-unique annotations.
-        Then suffle these indices and cut the necessary part of them.
-        '''
+    # def _initialize_annotations(self, annotations):
+    #     ''' Firstly, we follow "easy" strategy, processing MPII dataset.
+    #     It likes to contain several people on same image, but keeping them
+    #     in different "annotation" dictionaries. 
+    #     We'd like to delete ALL non-unique annotations.
+    #     Then shuffle these indices and cut the necessary part of them.
+    #     '''
 
-        # All this part till shuffle can be done with the preprocess!!!
-        # TODO!!!
-        unique_paths, ids_to_delete = [], []
-        for idx,annot in enumerate(annotations):
-            img_path = annot['img_paths']
-            if img_path in unique_paths:
-                ids_to_delete.append(idx)
-            else:
-                unique_paths.append(img_path)
+    #     # All this part till shuffle can be done with the preprocess!!!
+    #     # TODO!!!
+    #     unique_paths, ids_to_delete = [], []
+    #     for idx,annot in enumerate(annotations):
+    #         img_path = annot['img_paths']
+    #         if img_path in unique_paths:
+    #             ids_to_delete.append(idx)
+    #         else:
+    #             unique_paths.append(img_path)
 
-        for idx in ids_to_delete[::-1]:
-            del annotations[idx]
+    #     for idx in ids_to_delete[::-1]:
+    #         del annotations[idx]
 
-        # Now let's remain only "mode" data.
-        mode_ids = []
-        mode_key = 1 if self.mode == 'val' else 0
-        for idx, annot in enumerate(annotations):
-            if annot['isValidation'] == mode_key:
-                mode_ids.append(idx)
+    #     # Now let's remain only "mode" data.
+    #     mode_ids = []
+    #     mode_key = 1 if self.mode == 'val' else 0
+    #     for idx, annot in enumerate(annotations):
+    #         if annot['isValidation'] == mode_key:
+    #             mode_ids.append(idx)
 
-        random.seed(self.seed)
-        random.shuffle(mode_ids)
-        mode_ids = mode_ids[:self.num_images]
-        return annotations, mode_ids
+    #     random.seed(self.seed)
+    #     random.shuffle(mode_ids)
+    #     mode_ids = mode_ids[:self.num_images]
+    #     return annotations, mode_ids
 
 
     def __getitem__(self, idx):
-        annot = self.annotations[self.ids[idx]]
+        # old fashion getting item
+        # annot = self.annotations[self.ids[idx]]
+        annot = self.annotations[idx]
         img_path = self.PATH_MPII + 'Images/images/' + annot['img_paths']
         image = th.tensor((imread(img_path)/255)).permute(2,0,1)
 

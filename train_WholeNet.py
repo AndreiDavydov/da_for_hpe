@@ -14,34 +14,58 @@ from arg_parser import parse_args
 
 
 
-SAVE_PATH = './saved_models/'
+SAVEPATH = './saved_models/'
+DATASETS = (H36M, MPII)
+
+LR0 = 1e-3
+NUMWORKERS = 20
+OPTIM = Adam
+
+SEED = 0
 
 def dt():
     return datetime.now().strftime('%H:%M:%S')
 
-def init_training(datasets=(H36M, MPII), num_domains=2, do_da=False,
-        num_train_imgs=1000, num_val_imgs=100,
-        batch_size=10):
+def init_training(params):
+
+    if not os.path.isdir(params['save_path']):
+        os.mkdir(params['save_path'])
+
+    if th.cuda.is_available():
+        device = 'cuda:{}'.format(params['gpu_id'])
+    else:
+        print('Warning: You tried to use CUDA GPU, but it is not available. CPU is used for training.\n')
+        device = 'cpu'
+
+    device = th.device(device) 
+    params['device'] = device
 
     print(dt(), ' Loading model... ')
-    model = models.WholeNet(num_domains, do_da=do_da).to(device)
-    optimizer = Adam(model.parameters(), lr=1e-3)
+
+    model = models.WholeNet(params['num_domains'], params['pretrained'], 
+                        params['z_features'], params['hidden_features'], 
+                        do_da=params['do_da'], return_z=params['return_z']).to(device)
+
+    optimizer = OPTIM(model.parameters(), lr=LR0)
 
     criterion_dom_discr = BCELoss()
-    criterion_pose_regr = L1Loss()
+    criterion_pose_regr = L1Loss() if params['criterion'] == 'L1' else L2Loss()
     criterions = {'dd':criterion_dom_discr, 'pr':criterion_pose_regr}
 
     print(dt(), ' Preparing data loaders... ')
 
     dataloaders = {}
-    for i in range(num_domains):
+    for i in range(params['num_domains']):
         dataloaders[i] = {}
-        for num_images, mode, shuffle in zip([num_train_imgs, num_val_imgs], 
+        for num_images, mode, shuffle in zip(
+            [params['num_train_imgs'], params['num_val_imgs']], 
                                              ['train', 'val'], 
                                              [True, False]):
-            dataset = datasets[i](num_images=num_images, mode=mode)
-            dataloaders[i][mode] = DataLoader(dataset, batch_size=batch_size, 
-                shuffle=shuffle, num_workers=5)
+            if mode == 'val' and not params['do_val']:
+                continue
+            dataset = params['datasets'][i](num_images=num_images, mode=mode)
+            dataloaders[i][mode] = DataLoader(dataset, batch_size=params['batch_size'], 
+                shuffle=shuffle, num_workers=NUMWORKERS)
             print(dt(), ' Data for the domain {} (mode {}) is composed.'.format(i, mode))
 
     print(dt(), ' Initialization is done. \n________________________________')
@@ -52,12 +76,10 @@ def init_training(datasets=(H36M, MPII), num_domains=2, do_da=False,
 def compose_d(batch_size, domain_idx, num_domains):
     x = th.zeros((batch_size, num_domains))
     x[:,domain_idx] = 1
-    return x.to(device)
+    return x
 
 
-def save_state(epoch, model, optimizer, losses):
-    if not os.path.isdir(save_path):
-        os.mkdir(save_path)
+def save_state(epoch, model, optimizer, losses, params):
 
     state = {'rng_state':th.get_rng_state(),\
              'rng_states_cuda':th.cuda.get_rng_state_all()}
@@ -65,35 +87,35 @@ def save_state(epoch, model, optimizer, losses):
     state['state_dict'] = model.state_dict()
     state['opt_state_dict'] = optimizer.state_dict()
 
-    th.save(state, save_path+'state.pth')
-    th.save(losses, save_path+'losses.pth')
+    th.save(state, params['save_path']+'state.pth')
+    th.save(losses, params['save_path']+'losses.pth')
 
-    th.save(epoch, save_path+'epoch.pth')
-    th.save(params, save_path+'params.pth')
+    th.save(epoch, params['save_path']+'epoch.pth')
+    th.save(params, params['save_path']+'params.pth')
 
     print("\n ===>", dt(), "epoch = {}. ".format(epoch))
-    print("Model is saved to {}".format(save_path))
+    print("Model is saved to {}".format(params['save_path']))
 
 
-def load_state(model, optimizer):
-    assert os.path.isdir(save_path), 'There is no the directory: {}'.format(save_path)
+# def load_state(model, optimizer, save_path, device):
+#     assert os.path.isdir(save_path), 'There is no the directory: {}'.format(save_path)
 
-    state = th.load(save_path+'state.pth',
-        map_location=lambda storage,loc:storage.to(device))
+#     state = th.load(save_path+'state.pth',
+#         map_location=lambda storage,loc:storage.to(device))
     
-    model.load_state_dict(state['state_dict'])
-    optimizer.load_state_dict(state['opt_state_dict'])  
+#     model.load_state_dict(state['state_dict'])
+#     optimizer.load_state_dict(state['opt_state_dict'])  
     
-    th.set_rng_state(state['rng_state'].cpu()) 
+#     th.set_rng_state(state['rng_state'].cpu()) 
 
-    losses = th.load(save_path+'losses.pth')
-    params = th.load(save_path+'params.pth')
-    epoch = th.load(save_path+'epoch.pth')
+#     losses = th.load(save_path+'losses.pth')
+#     params = th.load(save_path+'params.pth')
+#     epoch = th.load(save_path+'epoch.pth')
 
-    return losses, params
+#     return losses, params
 
 
-def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, epoch):
+def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, params):
     hi_str = ' Training...' if mode == 'train' else ' Validation...'
     print(dt(), hi_str)
 
@@ -113,7 +135,7 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, epoch):
                 optimizer.zero_grad()
 
             imgs, joints, joints_valid = sample
-            imgs = imgs.float().to(device)
+            imgs = imgs.float().to(params['device'])
 
             if mode == 'val':
                 with th.no_grad(): 
@@ -122,12 +144,12 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, epoch):
                 p_hat, d_hat, z = model(imgs, domain_idx)
 
             if model.do_da:
-                d = compose_d(d_hat.size(0), domain_idx, model.num_domains)
+                d = compose_d(d_hat.size(0), domain_idx, model.num_domains).to(params['device'])
                 d_loss = criterions['dd'](d_hat, d)
                 losses[domain_idx]['dd'][mode].append(d_loss.data.cpu().numpy().item())
 
             if domain_idx == 0: # source domain, has labels
-                p = joints.float().to(device)
+                p = joints.float().to(params['device'])
                 p_loss = criterions['pr'](p_hat[joints_valid], p[joints_valid])
                 losses[domain_idx]['pr'][mode].append(p_loss.data.cpu().numpy().item())
                 
@@ -144,43 +166,46 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, epoch):
     #######################################################################
     #######################################################################
 
-def main():
+def print_params(params):
+    print('\n____________________________________\n')
+    print('parameters of the current experiment: \n')
+    [print("{0:<20}{1:>20}".format(key, val)) for key, val in zip(params, params.values())]
+    print('____________________________________\n\n')
 
+def parse_arguments():
+    # first, parse arguments from the input parameters.
     opt = parse_args()
 
-    datasets = (H36M, MPII)
-    num_domains = len(datasets)
-    gpu_id = opt.gpu_id
-    batch_size = opt.batch_size
-    num_epochs = opt.num_epochs
-    save_each_epoch = opt.save_each_epoch
-    num_train_imgs = opt.num_train_imgs 
-    num_val_imgs = opt.num_val_imgs
-    do_da = opt.do_da
-    return_z = opt.return_z
-
-    global seed
-    seed = opt.seed
-
-    global exp_name
     exp_name = opt.exp_name
+    save_path = SAVEPATH+exp_name+'/' if exp_name is not None else SAVEPATH
 
-    global save_path
-    save_path = SAVE_PATH+exp_name+'/' if exp_name is not None else SAVE_PATH
+    params = {'batch_size':             opt.batch_size, 
+              'criterion':              opt.loss,
+              'num_epochs':             opt.num_epochs, 
+              'save_each_epoch':        opt.save_each_epoch, 
+              'z_features':             opt.z_features,  
+              'hidden_features':        opt.hidden_features, 
+              'pretrained':             not opt.no_pretrained,
+              'gpu_id':                 opt.gpu_id,
+              'verbose':                not opt.no_verbose,
+              'num_train_imgs':         opt.num_train_imgs,
+              'num_val_imgs':           opt.num_val_imgs,
+              'do_da':                  not opt.no_da,
+              'do_val':                 not opt.no_val,      
+              'return_z':               opt.return_z,
+              'save_path':              save_path
+              }
 
-    global device
-    device = th.device('cuda:{}'.format(gpu_id)) # cpu is not even considered
-    
-    th.manual_seed(seed)
+    print_params(params)
+    return params
 
-    global params
-    params = {'datasets':datasets, 'num_domains':num_domains, 'gpu_id':gpu_id, 
-        'batch_size':batch_size, 'num_epochs':num_epochs, 'save_each_epoch':save_each_epoch, 
-        'num_train_imgs':num_train_imgs, 'num_val_imgs':num_val_imgs,
-        'do_da':do_da, 'return_z':return_z, 'save_path':save_path}
+def main():
 
-    init = init_training(datasets, num_domains, do_da,
-        num_train_imgs, num_val_imgs, batch_size)
+    params = parse_arguments()
+    params['datasets'] = DATASETS
+    params['num_domains'] = len(params['datasets'])
+
+    init = init_training(params)
 
     model, optimizer, criterions, dataloaders = init
 
@@ -189,22 +214,27 @@ def main():
     losses = {0:{'dd':{'train':[], 'val':[]}, 'pr':{'train':[], 'val':[]}},
               1:{'dd':{'train':[], 'val':[]}, 'pr':{'train':[], 'val':[]}}}
 
-    for epoch in range(1, num_epochs+1):
-        run_epoch('train', model, optimizer, criterions, dataloaders, losses, epoch)
-        run_epoch('val', model, optimizer, criterions, dataloaders, losses, epoch)
+    # let's add scheduler:
+    scheduler = None #th.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.01)
+
+    for epoch in range(1, params['num_epochs']+1):
+        run_epoch('train', model, optimizer, criterions, dataloaders, losses, params)
+        if params['do_val']:
+            run_epoch('val', model, optimizer, criterions, dataloaders, losses, params)
         
-        progress = epoch/num_epochs
+        progress = epoch/params['num_epochs']
         model.update_plasts(progress)
-        model.update_lambd(progress)
+        if model.do_da:
+            model.update_lambd(progress)
+        
+        if scheduler is not None:
+            scheduler.step()
 
-        tmp_losses = losses.copy()
-        th.save(tmp_losses, save_path+'tmp_losses.pth')
-
-        if epoch % save_each_epoch == 0 or epoch == 1:
-            save_state(epoch, model, optimizer, losses)
+        if epoch % params['save_each_epoch'] == 0 or epoch == 1:
+            save_state(epoch, model, optimizer, losses, params)
 
         print('----------------------------------------')
-        print(dt(), 'epoch {} out of {} is finished.'.format(epoch, num_epochs))
+        print(dt(), 'epoch {} out of {} is finished.'.format(epoch, params['num_epochs']))
         print('----------------------------------------')
     
 
