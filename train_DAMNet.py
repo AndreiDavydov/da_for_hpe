@@ -9,7 +9,7 @@ from datetime import datetime
 import os
 
 import models
-from dataset_loader import MPII, H36M 
+from datasets import MPII, H36M 
 from arg_parser import parse_args
 
 

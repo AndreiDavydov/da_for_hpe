@@ -9,13 +9,13 @@ from datetime import datetime
 import os
 
 import models
-from dataset_loader import MPII, H36M 
+from datasets import MPII, H36M 
 from arg_parser import parse_args
 
 
 
 SAVEPATH = './saved_models/'
-DATASETS = (H36M, MPII)
+DATASETS = (H36M, MPII)[::-1]
 
 LR0 = 1e-3
 NUMWORKERS = 20
@@ -42,9 +42,13 @@ def init_training(params):
 
     print(dt(), ' Loading model... ')
 
-    model = models.WholeNet(params['num_domains'], params['pretrained'], 
-                        params['z_features'], params['hidden_features'], 
-                        do_da=params['do_da'], return_z=params['return_z']).to(device)
+    model = models.WholeNet(params['num_domains'], 
+                            params['pretrained'], 
+                            params['z_features'], 
+                            params['hidden_features'], 
+                            do_da=params['do_da'], 
+                            use_heatmaps=params['use_heatmaps'], 
+                            return_z=params['return_z']).to(device)
 
     optimizer = OPTIM(model.parameters(), lr=LR0)
 
@@ -58,14 +62,17 @@ def init_training(params):
     for i in range(params['num_domains']):
         dataloaders[i] = {}
         for num_images, mode, shuffle in zip(
-            [params['num_train_imgs'], params['num_val_imgs']], 
+                                             [params['num_train_imgs'], params['num_val_imgs']], 
                                              ['train', 'val'], 
                                              [True, False]):
             if mode == 'val' and not params['do_val']:
                 continue
-            dataset = params['datasets'][i](num_images=num_images, mode=mode)
+            dataset = params['datasets'][i](num_images, mode, params['use_heatmaps'])
+            params['num_'+mode+'_imgs'] = len(dataset)
             dataloaders[i][mode] = DataLoader(dataset, batch_size=params['batch_size'], 
-                shuffle=shuffle, num_workers=NUMWORKERS)
+                                                    shuffle=shuffle, 
+                                                    num_workers=NUMWORKERS)
+
             print(dt(), ' Data for the domain {} (mode {}) is composed.'.format(i, mode))
 
     print(dt(), ' Initialization is done. \n________________________________')
@@ -87,7 +94,11 @@ def save_state(epoch, model, optimizer, losses, params):
     state['state_dict'] = model.state_dict()
     state['opt_state_dict'] = optimizer.state_dict()
 
-    th.save(state, params['save_path']+'state.pth')
+    print('save, ', epoch)
+    if epoch % 5 == 0:
+        th.save(state, params['save_path']+'state_'+'{:04d}'.format(epoch)+'.pth')
+        print('MODEL PARAMETERS ARE SAVED TO:')
+        print(params['save_path']+'state_'+'{:04d}'.format(epoch)+'.pth')
     th.save(losses, params['save_path']+'losses.pth')
 
     th.save(epoch, params['save_path']+'epoch.pth')
@@ -119,28 +130,23 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, params):
     hi_str = ' Training...' if mode == 'train' else ' Validation...'
     print(dt(), hi_str)
 
-    print(dt(), 'lengths of dataloaders: ', 
-        [len(dataloaders[domain][mode]) for domain in dataloaders])
-
-    for batch_idx, (sample0, sample1) in tqdm(enumerate(zip(dataloaders[0][mode],\
-                                        dataloaders[1][mode]))):
-        # sample0 - H36M
-        # sample1 - MPII
-
-        # if batch_idx+1 % 10 == 0:
-        #     print(dt(), 'Batch {}'.format(batch_idx))
-        for domain_idx, sample in enumerate([sample0, sample1]):
+    for domain_idx in dataloaders: # decided to do whole epoch for one (by one) domain
+        if len(dataloaders) > 1:
+            print('domain ', domain_idx) 
+        length_dl = len(dataloaders[domain_idx][mode]) 
+        for batch_idx, sample in tqdm(enumerate(dataloaders[domain_idx][mode]), desc='batch idx (out of {})'.format(length_dl)):
 
             if mode == 'train':
                 optimizer.zero_grad()
 
             imgs, joints, joints_valid = sample
-            imgs = imgs.float().to(params['device'])
+            imgs = imgs.to(params['device'])
 
             if mode == 'val':
-                with th.no_grad(): 
-                    p_hat, d_hat, z = model(imgs, domain_idx)
+                model.train()
+                with th.no_grad(): p_hat, d_hat, z = model(imgs, domain_idx)
             else:
+                model.eval()
                 p_hat, d_hat, z = model(imgs, domain_idx)
 
             if model.do_da:
@@ -149,14 +155,14 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, params):
                 losses[domain_idx]['dd'][mode].append(d_loss.data.cpu().numpy().item())
 
             if domain_idx == 0: # source domain, has labels
-                p = joints.float().to(params['device'])
+                p = joints.to(params['device'])
                 p_loss = criterions['pr'](p_hat[joints_valid], p[joints_valid])
+
                 losses[domain_idx]['pr'][mode].append(p_loss.data.cpu().numpy().item())
                 
             if mode == 'train':
                 if domain_idx == 0:
-                    p_loss.backward(retain_graph=True) if model.do_da else \
-                    p_loss.backward(retain_graph=False)
+                    p_loss.backward(retain_graph=True) if model.do_da else p_loss.backward(retain_graph=False)
                 if model.do_da:
                     d_loss.backward()
                 optimizer.step()
@@ -169,7 +175,11 @@ def run_epoch(mode, model, optimizer, criterions, dataloaders, losses, params):
 def print_params(params):
     print('\n____________________________________\n')
     print('parameters of the current experiment: \n')
-    [print("{0:<20}{1:>20}".format(key, val)) for key, val in zip(params, params.values())]
+    for key in params:
+        if key == 'datasets':
+            print("{0:<20}{1:>20}".format(key, str(params[key])))
+            continue
+        print("{0:<20}{1:>20}".format(key, params[key])) 
     print('____________________________________\n\n')
 
 def parse_arguments():
@@ -193,20 +203,23 @@ def parse_arguments():
               'do_da':                  not opt.no_da,
               'do_val':                 not opt.no_val,      
               'return_z':               opt.return_z,
+              'one_flow':              opt.one_flow,
+              'use_heatmaps':           not opt.map_joints,
               'save_path':              save_path
               }
 
+    params['datasets'] = (DATASETS[0],) if params['one_flow'] else DATASETS
+    params['num_domains'] = len(params['datasets'])
+
     print_params(params)
+
     return params
 
 def main():
 
     params = parse_arguments()
-    params['datasets'] = DATASETS
-    params['num_domains'] = len(params['datasets'])
-
+    
     init = init_training(params)
-
     model, optimizer, criterions, dataloaders = init
 
     # only two domains: H36M and MPII
@@ -215,7 +228,7 @@ def main():
               1:{'dd':{'train':[], 'val':[]}, 'pr':{'train':[], 'val':[]}}}
 
     # let's add scheduler:
-    scheduler = None #th.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.01)
+    scheduler = th.optim.lr_scheduler.MultiStepLR(optimizer, [50,100,150,200], gamma=0.2, last_epoch=-1)
 
     for epoch in range(1, params['num_epochs']+1):
         run_epoch('train', model, optimizer, criterions, dataloaders, losses, params)
@@ -223,7 +236,8 @@ def main():
             run_epoch('val', model, optimizer, criterions, dataloaders, losses, params)
         
         progress = epoch/params['num_epochs']
-        model.update_plasts(progress)
+        if not params['one_flow']:
+            model.update_plasts(progress)
         if model.do_da:
             model.update_lambd(progress)
         
